@@ -96,10 +96,15 @@ class TierManager:
 
         # During warm-up, only act on strong signature hits
         if warming_up:
+            # During warm-up stat engine is blind — rely entirely on signatures
             if sig_tier >= 4:
-                return self._escalate_to(4, "Exfiltration/Lateral signature during warm-up", now)
+                return self._escalate_to(4, "Exfil/Lateral signature during warm-up", now)
             elif sig_tier >= 3:
                 return self._escalate_to(3, "Execution/Credential signature during warm-up", now)
+            elif sig_tier >= 2:
+                return self._escalate_to(2, "Discovery signature during warm-up", now)
+            elif sig_tier >= 1:
+                return self._escalate_to(1, "Recon signature during warm-up", now)
             return self._maybe_deescalate(now)
 
         # ── Determine recommended tier ────────────────────────────────────────
@@ -113,7 +118,9 @@ class TierManager:
         recommended   = RISK_TO_TIER.get(lookup_key, 0)
 
         # Also consider the sig engine's direct tier suggestion
-        recommended   = max(recommended, sig_tier if combined_risk != "LOW" else 0)
+        # Signature engine fires regardless of stat engine state or warm-up
+        # A known attack tool must always trigger its tier
+        recommended   = max(recommended, sig_tier)
 
         # Multi-phase escalation bonus: if attacker is hitting 2+ different phases
         # it means they are progressing through the kill chain — escalate one extra tier

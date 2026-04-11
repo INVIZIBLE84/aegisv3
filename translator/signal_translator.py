@@ -123,7 +123,13 @@ SUSPICIOUS_ARGS = {
     "eval $(":         {"weight": 18, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (Eval Execution)"},
 
     # Reverse shell patterns
-    "/dev/tcp/":       {"weight": 25, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (Bash TCP Reverse Shell)"},
+    "nc -e ":           {"weight": 25, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (NC Reverse Shell -e flag)"},
+    "nc -c ":           {"weight": 25, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (NC Reverse Shell -c flag)"},
+    "ncat -e ":         {"weight": 25, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (Ncat Reverse Shell)"},
+    "-nvlp ":           {"weight": 18, "phase": PHASE_EXECUTION,   "mitre": "T1095 (Netcat Listener)"},
+    "-lvnp ":           {"weight": 18, "phase": PHASE_EXECUTION,   "mitre": "T1095 (Netcat Listener)"},
+    "-lnvp ":           {"weight": 18, "phase": PHASE_EXECUTION,   "mitre": "T1095 (Netcat Listener)"},
+    "/dev/tcp/":        {"weight": 25, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (Bash TCP Reverse Shell)"},
     "/dev/udp/":       {"weight": 25, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (Bash UDP Reverse Shell)"},
     "mkfifo":          {"weight": 20, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (Named Pipe Shell)"},
     "0>&1":            {"weight": 22, "phase": PHASE_EXECUTION,   "mitre": "T1059.004 (FD Redirect Shell)"},
@@ -142,6 +148,9 @@ SUSPICIOUS_ARGS = {
 
     # Exfiltration
     "| nc ":           {"weight": 22, "phase": PHASE_EXFIL,       "mitre": "T1048 (Exfil via Netcat)"},
+    "| nc	":          {"weight": 22, "phase": PHASE_EXFIL,       "mitre": "T1048 (Exfil via Netcat)"},
+    "tar czf - ":      {"weight": 20, "phase": PHASE_EXFIL,       "mitre": "T1048 (Data Staged for Exfil)"},
+    "tar cfz - ":      {"weight": 20, "phase": PHASE_EXFIL,       "mitre": "T1048 (Data Staged for Exfil)"},
     "| curl ":         {"weight": 15, "phase": PHASE_EXFIL,       "mitre": "T1048 (Exfil via Curl)"},
     "| wget ":         {"weight": 15, "phase": PHASE_EXFIL,       "mitre": "T1048 (Exfil via Wget)"},
 
