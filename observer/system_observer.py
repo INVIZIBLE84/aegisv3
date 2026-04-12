@@ -44,7 +44,6 @@ struct fork_data_t {
     u32  parent_pid;
     u32  child_pid;
     char parent_comm[16];
-    char child_comm[16];
 };
 
 BPF_PERF_OUTPUT(exec_events);
@@ -97,8 +96,8 @@ TRACEPOINT_PROBE(sched, sched_process_fork) {
     struct fork_data_t data = {};
     data.parent_pid = args->parent_pid;
     data.child_pid  = args->child_pid;
-    bpf_probe_read_str(&data.parent_comm, sizeof(data.parent_comm), args->parent_comm);
-    bpf_probe_read_str(&data.child_comm,  sizeof(data.child_comm),  args->child_comm);
+    /* Read parent comm from current task — child not yet named at fork time */
+    bpf_get_current_comm(&data.parent_comm, sizeof(data.parent_comm));
     fork_events.perf_submit(args, &data, sizeof(data));
     return 0;
 }
@@ -170,14 +169,13 @@ def on_fork_event(cpu, data, size):
     event = b["fork_events"].event(data)
     try:
         parent_comm = event.parent_comm.decode("utf-8", "replace").strip()
-        child_comm  = event.child_comm.decode("utf-8", "replace").strip()
     except Exception:
         return
     fork_buffer.append({
         "parent_pid":  event.parent_pid,
         "parent_comm": parent_comm,
         "child_pid":   event.child_pid,
-        "child_comm":  child_comm,
+        "child_comm":  "",   # filled in later via exec event ppid lookup
         "event_type":  "FORK",
     })
 
