@@ -3,7 +3,8 @@ aegis.py - Aegis-LX v3.0
 """
 import time, argparse, signal, sys, os
 from datetime import datetime
-from observer.system_observer import collect_process_info
+from observer.system_observer import collect_process_info, collect_file_events
+from detection.fim_engine import FIMEngine
 from translator.signal_translator import translate_process_to_signals
 from detection.stat_engine import StatEngine
 from detection.signature_engine import SignatureEngine
@@ -72,6 +73,17 @@ def print_sig_panel(sig_result):
         print("  " + M + "|" + R + "  " + RE + "! [" + h["phase"] + "]" + R + " " + cmd)
         print("  " + M + "|" + R + "    " + DIM + "-> " + h["mitre"][:65] + R)
     print("  " + M + "+" + "-"*50 + R)
+
+def print_fim_panel(fim_alerts):
+    print("\n  " + G + "+-- FILE INTEGRITY MONITOR (openat hook)" + R)
+    if not fim_alerts:
+        print("  " + G + "|" + R + "  " + G + "No sensitive file access detected" + R)
+    for a in fim_alerts:
+        tc = RE if a["tier"] >= 3 else Y
+        print("  " + G + "|" + R + "  " + tc + "! [" + a["phase"] + "] " + a["process"] + " opened " + a["filename"] + R)
+        print("  " + G + "|" + R + "    " + DIM + "-> " + a["mitre"] + "  Tier " + str(a["tier"]) + R)
+    print("  " + G + "+" + "-"*50 + R)
+
 
 PHASE_ORDER = ["RECON","DISCOVERY","CREDENTIAL","EXECUTION","PERSISTENCE","EXFILTRATION","LATERAL"]
 
@@ -172,6 +184,7 @@ def run_demo(logger):
         print_header(cycle, tier_manager, stat_report.get("warming_up", False))
         print_stat_panel(stat_report)
         print_sig_panel(sig_result)
+        print_fim_panel(fim_alerts)
         print_killchain_panel(sig_result, tier_manager)
         print_tier_panel(tier_manager, change)
     print("\n  " + G + B + "Demo complete. All tiers demonstrated." + R)
@@ -185,6 +198,7 @@ def run_monitor(logger):
     print("  " + DIM + "Ctrl+C to stop  |  sudo python3 aegis.py --lockdown for Tier 5" + R + "\n")
     stat_engine  = StatEngine()
     sig_engine   = SignatureEngine()
+    fim_engine   = FIMEngine()
     tier_manager = TierManager()
     cycle        = 0
 
@@ -216,6 +230,27 @@ def run_monitor(logger):
                 logger.log_signal(s)
         stat_report = stat_engine.observe(signals)
         sig_result  = sig_engine.analyze(signals)
+
+        # FIM: check what files were opened this cycle
+        file_events = collect_file_events()
+        fim_alerts  = fim_engine.analyze(file_events)
+
+        # If FIM caught something, escalate tier directly to the alert's tier
+        for alert in fim_alerts:
+            logger.log_risk({"tier": alert["tier"], "stat_level": "FIM",
+                             "sig_score": 0, "phases": [alert["phase"]],
+                             "fim_detail": alert["detail"]})
+            if alert["tier"] > tier_manager.current:
+                fim_change = tier_manager._escalate_to(
+                    alert["tier"],
+                    "[FIM] " + alert["detail"],
+                    __import__('time').time()
+                )
+                apply_tier(fim_change["new_tier"], fim_change["old_tier"], [])
+                alert_tier_change(fim_change["old_tier"], fim_change["new_tier"],
+                                  fim_change["reason"], [])
+                logger.log_tier_change(fim_change)
+
         change      = tier_manager.evaluate(stat_report, sig_result)
         if change["changed"]:
             apply_tier(change["new_tier"], change["old_tier"], sig_result["hits"])
