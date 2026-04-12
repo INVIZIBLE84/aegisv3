@@ -3,8 +3,9 @@ aegis.py - Aegis-LX v3.0
 """
 import time, argparse, signal, sys, os
 from datetime import datetime
-from observer.system_observer import collect_process_info, collect_file_events
+from observer.system_observer import collect_process_info, collect_file_events, collect_fork_events
 from detection.fim_engine import FIMEngine
+from detection.lineage_engine import LineageEngine
 from translator.signal_translator import translate_process_to_signals
 from detection.stat_engine import StatEngine
 from detection.signature_engine import SignatureEngine
@@ -83,6 +84,20 @@ def print_fim_panel(fim_alerts):
         print("  " + G + "|" + R + "  " + tc + "! [" + a["phase"] + "] " + a["process"] + " opened " + a["filename"] + R)
         print("  " + G + "|" + R + "    " + DIM + "-> " + a["mitre"] + "  Tier " + str(a["tier"]) + R)
     print("  " + G + "+" + "-"*50 + R)
+
+
+def print_lineage_panel(lineage_alerts):
+    print("\n  " + C + "+-- PROCESS LINEAGE MONITOR (fork/exec tracking)" + R)
+    if not lineage_alerts:
+        print("  " + C + "|" + R + "  " + G + "No suspicious parent-child relationships detected" + R)
+    for a in lineage_alerts:
+        tc = RE if a["tier"] >= 4 else Y
+        print("  " + C + "|" + R + "  " + tc + "! [" + a["phase"] + "] " +
+              a["parent_name"] + " (PID " + str(a["parent_pid"]) + ")" +
+              " --> " + a["child_name"] + " (PID " + str(a["child_pid"]) + ")" + R)
+        print("  " + C + "|" + R + "    " + DIM + "cmd: " + a["full_cmd"][:60] + R)
+        print("  " + C + "|" + R + "    " + DIM + "-> " + a["mitre"][:65] + "  Tier " + str(a["tier"]) + R)
+    print("  " + C + "+" + "-"*50 + R)
 
 
 PHASE_ORDER = ["RECON","DISCOVERY","CREDENTIAL","EXECUTION","PERSISTENCE","EXFILTRATION","LATERAL"]
@@ -176,6 +191,26 @@ def run_demo(logger):
         logger.log_demo_event(phase_label, description)
         stat_report = stat_engine.observe(fake_signals)
         sig_result  = sig_engine.analyze(fake_signals)
+        # LINEAGE: feed fork events + analyze exec events for suspicious spawn chains
+        fork_events    = collect_fork_events()
+        lineage_engine.ingest_fork(fork_events)
+        lineage_alerts = lineage_engine.analyze(raw)
+
+        for alert in lineage_alerts:
+            logger.log_risk({"tier": alert["tier"], "stat_level": "LINEAGE",
+                             "sig_score": 0, "phases": [alert["phase"]],
+                             "lineage_detail": alert["detail"]})
+            if alert["tier"] > tier_manager.current:
+                lin_change = tier_manager._escalate_to(
+                    alert["tier"],
+                    "[LINEAGE] " + alert["detail"],
+                    __import__('time').time()
+                )
+                apply_tier(lin_change["new_tier"], lin_change["old_tier"], [])
+                alert_tier_change(lin_change["old_tier"], lin_change["new_tier"],
+                                  lin_change["reason"], [])
+                logger.log_tier_change(lin_change)
+
         change      = tier_manager.evaluate(stat_report, sig_result)
         if change["changed"]:
             apply_tier(change["new_tier"], change["old_tier"], sig_result["hits"])
@@ -185,6 +220,7 @@ def run_demo(logger):
         print_stat_panel(stat_report)
         print_sig_panel(sig_result)
         print_fim_panel(fim_alerts)
+        print_lineage_panel(lineage_alerts)
         print_killchain_panel(sig_result, tier_manager)
         print_tier_panel(tier_manager, change)
     print("\n  " + G + B + "Demo complete. All tiers demonstrated." + R)
@@ -198,8 +234,9 @@ def run_monitor(logger):
     print("  " + DIM + "Ctrl+C to stop  |  sudo python3 aegis.py --lockdown for Tier 5" + R + "\n")
     stat_engine  = StatEngine()
     sig_engine   = SignatureEngine()
-    fim_engine   = FIMEngine()
-    tier_manager = TierManager()
+    fim_engine     = FIMEngine()
+    lineage_engine = LineageEngine()
+    tier_manager   = TierManager()
     cycle        = 0
 
     def on_exit(sig, frame):

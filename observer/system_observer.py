@@ -1,7 +1,8 @@
 # observer/system_observer.py
-# Two eBPF hooks:
-#   1. sys_enter_execve  - catches every process execution (existing)
-#   2. sys_enter_openat  - catches every file open (new - kills LOLBin problem)
+# Three eBPF hooks:
+#   1. sys_enter_execve  - every process execution
+#   2. sys_enter_openat  - every file open (FIM)
+#   3. sched_process_fork - every fork/clone (parent-child lineage)
 
 try:
     from bcc import BPF
@@ -19,8 +20,10 @@ bpf_text = """
 #define ARGSIZE  64
 #define PATHSIZE 128
 
+/* ── exec event: process execution ── */
 struct exec_data_t {
     u32  pid;
+    u32  ppid;
     char comm[16];
     char arg0[ARGSIZE];
     char arg1[ARGSIZE];
@@ -29,18 +32,36 @@ struct exec_data_t {
     char arg4[ARGSIZE];
 };
 
+/* ── open event: file access ── */
 struct open_data_t {
     u32  pid;
     char comm[16];
     char filename[PATHSIZE];
 };
 
+/* ── fork event: parent-child relationship ── */
+struct fork_data_t {
+    u32  parent_pid;
+    u32  child_pid;
+    char parent_comm[16];
+    char child_comm[16];
+};
+
 BPF_PERF_OUTPUT(exec_events);
 BPF_PERF_OUTPUT(open_events);
+BPF_PERF_OUTPUT(fork_events);
 
+/* ── Hook 1: execve ── */
 TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     struct exec_data_t data = {};
-    data.pid = bpf_get_current_pid_tgid() >> 32;
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    data.pid  = pid_tgid >> 32;
+
+    /* Get parent PID from the task struct */
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    data.ppid = task->real_parent->tgid;
+
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
 
     const char **argv = (const char **)(args->argv);
@@ -61,6 +82,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
     return 0;
 }
 
+/* ── Hook 2: openat ── */
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     struct open_data_t data = {};
     data.pid = bpf_get_current_pid_tgid() >> 32;
@@ -69,15 +91,28 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     open_events.perf_submit(args, &data, sizeof(data));
     return 0;
 }
+
+/* ── Hook 3: fork/clone — capture parent-child relationship ── */
+TRACEPOINT_PROBE(sched, sched_process_fork) {
+    struct fork_data_t data = {};
+    data.parent_pid = args->parent_pid;
+    data.child_pid  = args->child_pid;
+    bpf_probe_read_str(&data.parent_comm, sizeof(data.parent_comm), args->parent_comm);
+    bpf_probe_read_str(&data.child_comm,  sizeof(data.child_comm),  args->child_comm);
+    fork_events.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
 """
 
-print("[Observer] Compiling eBPF hooks (execve + openat)...")
+print("[Observer] Compiling eBPF hooks (execve + openat + fork)...")
 
 b = BPF(text=bpf_text)
 
 exec_buffer = []
 open_buffer = []
+fork_buffer = []
 
+# ── execve handler ────────────────────────────────────────────────────────────
 def on_exec_event(cpu, data, size):
     event = b["exec_events"].event(data)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -97,6 +132,7 @@ def on_exec_event(cpu, data, size):
     exec_buffer.append({
         "timestamp":     timestamp,
         "pid":           event.pid,
+        "ppid":          event.ppid,
         "process_name":  base_cmd,
         "full_cmd":      full_cmd,
         "user":          "root",
@@ -105,6 +141,7 @@ def on_exec_event(cpu, data, size):
         "event_type":    "EXEC",
     })
 
+# ── openat handler ────────────────────────────────────────────────────────────
 def on_open_event(cpu, data, size):
     event = b["open_events"].event(data)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -116,16 +153,10 @@ def on_open_event(cpu, data, size):
         filename = event.filename.decode("utf-8", "replace").strip()
     except Exception:
         filename = "unknown"
-
     if not filename:
         return
-    if filename.startswith("/proc/"):
+    if filename.startswith("/proc/") or filename.startswith("/sys/") or filename.startswith("/dev/"):
         return
-    if filename.startswith("/sys/"):
-        return
-    if filename.startswith("/dev/"):
-        return
-
     open_buffer.append({
         "timestamp":    timestamp,
         "pid":          event.pid,
@@ -134,8 +165,25 @@ def on_open_event(cpu, data, size):
         "event_type":   "OPEN",
     })
 
+# ── fork handler ──────────────────────────────────────────────────────────────
+def on_fork_event(cpu, data, size):
+    event = b["fork_events"].event(data)
+    try:
+        parent_comm = event.parent_comm.decode("utf-8", "replace").strip()
+        child_comm  = event.child_comm.decode("utf-8", "replace").strip()
+    except Exception:
+        return
+    fork_buffer.append({
+        "parent_pid":  event.parent_pid,
+        "parent_comm": parent_comm,
+        "child_pid":   event.child_pid,
+        "child_comm":  child_comm,
+        "event_type":  "FORK",
+    })
+
 b["exec_events"].open_perf_buffer(on_exec_event)
 b["open_events"].open_perf_buffer(on_open_event)
+b["fork_events"].open_perf_buffer(on_fork_event)
 
 def _poll_loop():
     while True:
@@ -147,14 +195,25 @@ def _poll_loop():
 _thread = threading.Thread(target=_poll_loop, daemon=True)
 _thread.start()
 
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def collect_process_info():
+    """Execution events — for signal_translator pipeline."""
     global exec_buffer
     batch = list(exec_buffer)
     exec_buffer.clear()
     return batch
 
 def collect_file_events():
+    """File open events — for fim_engine pipeline."""
     global open_buffer
     batch = list(open_buffer)
     open_buffer.clear()
+    return batch
+
+def collect_fork_events():
+    """Fork/spawn events — for lineage_engine pipeline."""
+    global fork_buffer
+    batch = list(fork_buffer)
+    fork_buffer.clear()
     return batch
