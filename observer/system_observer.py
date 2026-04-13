@@ -1,8 +1,9 @@
 # observer/system_observer.py
-# Three eBPF hooks:
-#   1. sys_enter_execve  - every process execution
-#   2. sys_enter_openat  - every file open (FIM)
-#   3. sched_process_fork - every fork/clone (parent-child lineage)
+# Four eBPF hooks:
+#   1. sys_enter_execve   - every process execution
+#   2. sys_enter_openat   - every file open (FIM)
+#   3. sched_process_fork - every fork/clone (lineage)
+#   4. sys_enter_connect  - every outbound connection (network monitor)
 
 try:
     from bcc import BPF
@@ -46,9 +47,19 @@ struct fork_data_t {
     char parent_comm[16];
 };
 
+/* ── connect event: outbound network connection ── */
+struct net_data_t {
+    u32  pid;
+    char comm[16];
+    u32  daddr;      /* destination IP (IPv4, network byte order) */
+    u16  dport;      /* destination port (network byte order)     */
+    u16  family;     /* AF_INET=2, AF_INET6=10                    */
+};
+
 BPF_PERF_OUTPUT(exec_events);
 BPF_PERF_OUTPUT(open_events);
 BPF_PERF_OUTPUT(fork_events);
+BPF_PERF_OUTPUT(net_events);
 
 /* ── Hook 1: execve ── */
 TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
@@ -101,6 +112,28 @@ TRACEPOINT_PROBE(sched, sched_process_fork) {
     fork_events.perf_submit(args, &data, sizeof(data));
     return 0;
 }
+
+/* ── Hook 4: sys_connect — capture every outbound connection attempt ── */
+TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
+    struct net_data_t data = {};
+    data.pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+    /* Read the sockaddr struct passed to connect() */
+    struct sockaddr sa = {};
+    bpf_probe_read_user(&sa, sizeof(sa), (void *)args->uservaddr);
+    data.family = sa.sa_family;
+
+    if (sa.sa_family == 2) {   /* AF_INET = 2 */
+        struct sockaddr_in sin = {};
+        bpf_probe_read_user(&sin, sizeof(sin), (void *)args->uservaddr);
+        data.daddr = sin.sin_addr.s_addr;
+        data.dport = sin.sin_port;
+    }
+
+    net_events.perf_submit(args, &data, sizeof(data));
+    return 0;
+}
 """
 
 print("[Observer] Compiling eBPF hooks (execve + openat + fork)...")
@@ -110,6 +143,7 @@ b = BPF(text=bpf_text)
 exec_buffer = []
 open_buffer = []
 fork_buffer = []
+net_buffer  = []
 
 # ── execve handler ────────────────────────────────────────────────────────────
 def on_exec_event(cpu, data, size):
@@ -179,9 +213,50 @@ def on_fork_event(cpu, data, size):
         "event_type":  "FORK",
     })
 
+def on_net_event(cpu, data, size):
+    import socket, struct
+    event = b["net_events"].event(data)
+    try:
+        proc = event.comm.decode("utf-8", "replace").strip()
+    except Exception:
+        proc = "unknown"
+
+    family = event.family
+
+    # Only care about IPv4 (AF_INET=2) for now
+    if family != 2:
+        return
+
+    try:
+        # Convert network-byte-order u32 to dotted IP string
+        daddr = socket.inet_ntoa(struct.pack("I", event.daddr))
+    except Exception:
+        daddr = "unknown"
+
+    try:
+        # Convert network-byte-order u16 to host port
+        dport = socket.ntohs(event.dport)
+    except Exception:
+        dport = 0
+
+    # Skip loopback and unresolved
+    if daddr.startswith("127.") or daddr == "0.0.0.0" or dport == 0:
+        return
+
+    import datetime as _dt
+    net_buffer.append({
+        "timestamp":    _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pid":          event.pid,
+        "process_name": proc,
+        "dest_ip":      daddr,
+        "dest_port":    dport,
+        "event_type":   "CONNECT",
+    })
+
 b["exec_events"].open_perf_buffer(on_exec_event)
 b["open_events"].open_perf_buffer(on_open_event)
 b["fork_events"].open_perf_buffer(on_fork_event)
+b["net_events"].open_perf_buffer(on_net_event)
 
 def _poll_loop():
     while True:
@@ -214,4 +289,11 @@ def collect_fork_events():
     global fork_buffer
     batch = list(fork_buffer)
     fork_buffer.clear()
+    return batch
+
+def collect_network_events():
+    """Outbound connection events — for network_engine pipeline."""
+    global net_buffer
+    batch = list(net_buffer)
+    net_buffer.clear()
     return batch

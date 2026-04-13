@@ -3,7 +3,8 @@ aegis.py - Aegis-LX v3.0
 """
 import time, argparse, signal, sys, os
 from datetime import datetime
-from observer.system_observer import collect_process_info, collect_file_events, collect_fork_events
+from observer.system_observer import collect_process_info, collect_file_events, collect_fork_events, collect_network_events
+from detection.network_engine import NetworkEngine
 from detection.fim_engine import FIMEngine
 from detection.lineage_engine import LineageEngine
 from translator.signal_translator import translate_process_to_signals
@@ -98,6 +99,19 @@ def print_lineage_panel(lineage_alerts):
         print("  " + C + "|" + R + "    " + DIM + "cmd: " + a["full_cmd"][:60] + R)
         print("  " + C + "|" + R + "    " + DIM + "-> " + a["mitre"][:65] + "  Tier " + str(a["tier"]) + R)
     print("  " + C + "+" + "-"*50 + R)
+
+
+def print_network_panel(net_alerts):
+    print("\n  " + W + "+-- NETWORK MONITOR (sys_connect hook)" + R)
+    if not net_alerts:
+        print("  " + W + "|" + R + "  " + G + "No suspicious outbound connections detected" + R)
+    for a in net_alerts:
+        tc = RE if a["tier"] >= 4 else Y
+        print("  " + W + "|" + R + "  " + tc + "! [" + a["phase"] + "] " +
+              a["process"] + " -> " + a["dest"] + R)
+        print("  " + W + "|" + R + "    " + DIM + "-> " + a["mitre"][:65] +
+              "  Tier " + str(a["tier"]) + R)
+    print("  " + W + "+" + "-"*50 + R)
 
 
 PHASE_ORDER = ["RECON","DISCOVERY","CREDENTIAL","EXECUTION","PERSISTENCE","EXFILTRATION","LATERAL"]
@@ -211,6 +225,25 @@ def run_demo(logger):
                                   lin_change["reason"], [])
                 logger.log_tier_change(lin_change)
 
+        # NETWORK: check outbound connections this cycle
+        net_events_raw = collect_network_events()
+        net_alerts     = network_engine.analyze(net_events_raw)
+
+        for alert in net_alerts:
+            logger.log_risk({"tier": alert["tier"], "stat_level": "NETWORK",
+                             "sig_score": 0, "phases": [alert["phase"]],
+                             "net_detail": alert["detail"]})
+            if alert["tier"] > tier_manager.current:
+                net_change = tier_manager._escalate_to(
+                    alert["tier"],
+                    "[NET] " + alert["detail"],
+                    __import__('time').time()
+                )
+                apply_tier(net_change["new_tier"], net_change["old_tier"], [])
+                alert_tier_change(net_change["old_tier"], net_change["new_tier"],
+                                  net_change["reason"], [])
+                logger.log_tier_change(net_change)
+
         change      = tier_manager.evaluate(stat_report, sig_result)
         if change["changed"]:
             apply_tier(change["new_tier"], change["old_tier"], sig_result["hits"])
@@ -221,6 +254,7 @@ def run_demo(logger):
         print_sig_panel(sig_result)
         print_fim_panel(fim_alerts)
         print_lineage_panel(lineage_alerts)
+        print_network_panel(net_alerts)
         print_killchain_panel(sig_result, tier_manager)
         print_tier_panel(tier_manager, change)
     print("\n  " + G + B + "Demo complete. All tiers demonstrated." + R)
@@ -235,8 +269,9 @@ def run_monitor(logger):
     stat_engine  = StatEngine()
     sig_engine   = SignatureEngine()
     fim_engine     = FIMEngine()
-    lineage_engine = LineageEngine()
-    tier_manager   = TierManager()
+    lineage_engine  = LineageEngine()
+    network_engine  = NetworkEngine()
+    tier_manager    = TierManager()
     cycle        = 0
 
     def on_exit(sig, frame):
