@@ -115,28 +115,34 @@ class LineageEngine:
     """
     Tracks process parent-child relationships and flags suspicious spawn chains.
 
-    Two data sources:
-      - fork_events: gives us parent_pid -> child_pid mapping
-      - exec_events (via ppid field): gives us ppid at execution time
-
-    We maintain a pid_to_name map so we can resolve ppid -> parent process name.
+    Handles multi-hop chains:
+      python3 -> sh -> bash -> whoami
+    Once a suspicious parent spawns anything, its children are "tainted" —
+    tracked in a tainted_pids set so the chain is followed.
     """
 
     def __init__(self):
-        # pid -> process_name, kept as a rolling map
-        # Limited to 2000 entries to prevent memory growth
-        self.pid_map = {}
-        self.MAX_PIDS = 2000
+        self.pid_map     = {}   # pid -> process_name
+        self.tainted     = {}   # pid -> reason (why this pid is tainted)
+        self.MAX_PIDS    = 2000
+        self.MAX_TAINTED = 500
 
     def ingest_fork(self, fork_events):
-        """Feed fork events to update the pid->name map."""
+        """Feed fork events — propagate taint to children."""
         for ev in fork_events:
-            self._register(ev["parent_pid"], ev["parent_comm"])
-            self._register(ev["child_pid"],  ev["child_comm"])
+            ppid  = ev.get("parent_pid")
+            cpid  = ev.get("child_pid")
+            pname = ev.get("parent_comm", "")
+            self._register(ppid, pname)
+            # If parent is tainted, child inherits taint
+            if ppid in self.tainted:
+                self._taint(cpid, "child of tainted PID " + str(ppid) +
+                            " (" + self.tainted[ppid] + ")")
 
     def analyze(self, exec_events):
         """
-        Check each execution event for suspicious parent-child combinations.
+        Check each execution for suspicious parent-child combinations.
+        Also flags any exec by a tainted process.
         Returns list of lineage alert dicts.
         """
         alerts = []
@@ -146,52 +152,63 @@ class LineageEngine:
             ppid  = ev.get("ppid")
             child = ev.get("process_name", "unknown")
 
-            # Register this process in our map
             self._register(pid, child)
 
-            # Skip if no parent info
             if not ppid:
                 continue
 
-            # Resolve parent name from our map
             parent = self.pid_map.get(ppid, "unknown")
 
-            if parent == "unknown":
-                continue
+            # ── Check 1: direct suspicious parent-child ───────────────────
+            if parent != "unknown" and (parent, child) not in TRUSTED_PAIRS:
+                result = _classify(parent, child)
+                if result:
+                    phase, tier, description = result
+                    # Taint this pid so its children are also tracked
+                    self._taint(pid, description)
+                    alerts.append(self._make_alert(
+                        ppid, parent, pid, child, ev, phase, tier, description))
+                    continue
 
-            # Skip explicitly trusted pairs
-            if (parent, child) in TRUSTED_PAIRS:
-                continue
-
-            # Classify the combination
-            result = _classify(parent, child)
-            if result is None:
-                continue
-
-            phase, tier, description = result
-
-            alerts.append({
-                "source":      "LINEAGE",
-                "parent_pid":  ppid,
-                "parent_name": parent,
-                "child_pid":   pid,
-                "child_name":  child,
-                "full_cmd":    ev.get("full_cmd", child),
-                "phase":       phase,
-                "tier":        tier,
-                "mitre":       "T1059 (Command and Scripting Interpreter via " + parent + ")",
-                "detail":      description,
-                "timestamp":   ev.get("timestamp", ""),
-            })
+            # ── Check 2: tainted parent executing anything notable ─────────
+            if ppid in self.tainted and child in (SHELL_PROCESSES | ATTACK_PROCESSES):
+                reason = self.tainted[ppid]
+                description = "tainted chain: " + child + " spawned from " + parent + " (" + reason + ")"
+                self._taint(pid, description)
+                alerts.append(self._make_alert(
+                    ppid, parent, pid, child, ev,
+                    "EXECUTION", 3, description))
 
         return alerts
+
+    def _make_alert(self, ppid, parent, pid, child, ev, phase, tier, description):
+        return {
+            "source":      "LINEAGE",
+            "parent_pid":  ppid,
+            "parent_name": parent,
+            "child_pid":   pid,
+            "child_name":  child,
+            "full_cmd":    ev.get("full_cmd", child),
+            "phase":       phase,
+            "tier":        tier,
+            "mitre":       "T1059 (Command Execution via " + parent + ")",
+            "detail":      description,
+            "timestamp":   ev.get("timestamp", ""),
+        }
+
+    def _taint(self, pid, reason):
+        if pid is None:
+            return
+        if len(self.tainted) >= self.MAX_TAINTED:
+            keys = list(self.tainted.keys())[:100]
+            for k in keys:
+                del self.tainted[k]
+        self.tainted[pid] = reason
 
     def _register(self, pid, name):
         if pid is None or not name:
             return
-        # Evict oldest entries if map is full
         if len(self.pid_map) >= self.MAX_PIDS:
-            # Remove the first 200 entries (oldest)
             keys = list(self.pid_map.keys())[:200]
             for k in keys:
                 del self.pid_map[k]

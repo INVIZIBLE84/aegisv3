@@ -65,14 +65,22 @@ SENSITIVE_FILES = {
 # sshd needs to read authorized_keys. passwd needs to read shadow. Etc.
 
 TRUSTED_PROCESSES = {
+    # Auth and login daemons — must read shadow/passwd
     "sshd", "login", "passwd", "su", "sudo", "PAM",
     "systemd", "systemd-logind", "cron", "crond",
     "useradd", "usermod", "userdel", "groupadd",
-    "chpasswd", "chage", "newgrp",
-    "polkit", "polkitd",
-    "aegis",        # never flag ourselves
-    "python3",      # aegis runs as python3
-    "python",
+    "chpasswd", "chage", "newgrp", "newuidmap", "newgidmap",
+    "polkit", "polkitd", "pkexec",
+    # Standard tools that call getpwuid()/getgrnam() internally
+    # These read /etc/passwd simply to resolve usernames — NOT suspicious
+    "whoami", "id", "groups", "ls", "stat", "ps",
+    "top", "htop", "w", "who", "last", "finger",
+    "ssh", "scp", "rsync", "git",
+    "apt", "apt-get", "dpkg", "snap",
+    "man", "less", "more",
+    "bash", "sh", "zsh", "dash",
+    # Aegis own processes
+    "aegis", "python3", "python",
 }
 
 
