@@ -29,6 +29,10 @@ This catches attacks that bypass both dictionary AND file watchlist:
 
 # ── Processes that should NEVER spawn interactive shells or recon tools ───────
 # These are services. If they spawn a shell, something is very wrong.
+# Aegis's own PID — loaded at runtime so we never flag ourselves
+import os as _os
+AEGIS_PID = _os.getpid()
+
 SUSPICIOUS_PARENTS = {
     # Web servers
     "nginx", "apache2", "apache", "httpd", "lighttpd", "caddy",
@@ -40,6 +44,11 @@ SUSPICIOUS_PARENTS = {
     # Other services that should never shell out
     "named", "bind", "vsftpd", "proftpd", "dovecot", "postfix",
     "sendmail", "exim4", "cups", "cupsd",
+    # Scripting interpreters — spawning a shell from these = suspicious
+    # (Aegis itself is excluded by PID check, not by name)
+    "python3", "python", "python2",
+    "perl", "ruby", "lua",
+    "node", "nodejs",
 }
 
 # ── Shell processes — dangerous when spawned by a service ────────────────────
@@ -88,11 +97,16 @@ TRUSTED_PAIRS = {
 }
 
 # Severity of the finding based on what combination was detected
-def _classify(parent, child):
+def _classify(parent, child, parent_pid=None):
     """
     Returns (phase, tier, description) or None if not suspicious.
+    parent_pid: if provided, skip if this is Aegis's own PID.
     """
-    # Service spawning a shell = almost certainly RCE
+    # Never flag Aegis's own python3 process
+    if parent_pid is not None and parent_pid == AEGIS_PID:
+        return None
+
+    # Scripting interpreter or service spawning a shell = RCE
     if parent in SUSPICIOUS_PARENTS and child in SHELL_PROCESSES:
         return (
             "EXECUTION",
@@ -100,12 +114,12 @@ def _classify(parent, child):
             parent + " spawned shell " + child + " -- likely RCE"
         )
 
-    # Service spawning an attack tool = also very suspicious
+    # Scripting interpreter or service spawning an attack tool
     if parent in SUSPICIOUS_PARENTS and child in ATTACK_PROCESSES:
         return (
             "EXECUTION",
             3,
-            parent + " spawned " + child + " -- suspicious service behaviour"
+            parent + " spawned " + child + " -- suspicious behaviour"
         )
 
     return None
@@ -161,7 +175,7 @@ class LineageEngine:
 
             # ── Check 1: direct suspicious parent-child ───────────────────
             if parent != "unknown" and (parent, child) not in TRUSTED_PAIRS:
-                result = _classify(parent, child)
+                result = _classify(parent, child, parent_pid=ppid)
                 if result:
                     phase, tier, description = result
                     # Taint this pid so its children are also tracked
