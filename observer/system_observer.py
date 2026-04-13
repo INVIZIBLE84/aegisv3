@@ -17,6 +17,9 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
+#include <linux/in.h>
+#include <linux/in6.h>
+#include <uapi/linux/un.h>
 
 #define ARGSIZE  64
 #define PATHSIZE 128
@@ -119,16 +122,21 @@ TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
     data.pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
 
-    /* Read the sockaddr struct passed to connect() */
-    struct sockaddr sa = {};
-    bpf_probe_read_user(&sa, sizeof(sa), (void *)args->uservaddr);
-    data.family = sa.sa_family;
+    /* Read sa_family (first 2 bytes of sockaddr) directly */
+    u16 family = 0;
+    bpf_probe_read_user(&family, sizeof(family), (void *)args->uservaddr);
+    data.family = family;
 
-    if (sa.sa_family == 2) {   /* AF_INET = 2 */
-        struct sockaddr_in sin = {};
-        bpf_probe_read_user(&sin, sizeof(sin), (void *)args->uservaddr);
-        data.daddr = sin.sin_addr.s_addr;
-        data.dport = sin.sin_port;
+    if (family == 2) {   /* AF_INET = 2 */
+        /* sockaddr_in layout: u16 family, u16 port, u32 addr */
+        u16 port = 0;
+        u32 addr = 0;
+        bpf_probe_read_user(&port, sizeof(port),
+                            (void *)args->uservaddr + 2);
+        bpf_probe_read_user(&addr, sizeof(addr),
+                            (void *)args->uservaddr + 4);
+        data.dport = port;
+        data.daddr = addr;
     }
 
     net_events.perf_submit(args, &data, sizeof(data));
