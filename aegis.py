@@ -3,7 +3,7 @@ aegis.py - Aegis-LX v3.0
 """
 import time, argparse, signal, sys, os
 from datetime import datetime
-from observer.system_observer import collect_process_info, collect_file_events, collect_fork_events, collect_network_events
+from observer.system_observer import collect_process_info, collect_file_events
 from detection.network_engine import NetworkEngine
 from detection.fim_engine import FIMEngine
 from detection.lineage_engine import LineageEngine
@@ -205,9 +205,7 @@ def run_demo(logger):
         logger.log_demo_event(phase_label, description)
         stat_report = stat_engine.observe(fake_signals)
         sig_result  = sig_engine.analyze(fake_signals)
-        # LINEAGE: feed fork events + analyze exec events for suspicious spawn chains
-        fork_events    = collect_fork_events()
-        lineage_engine.ingest_fork(fork_events)
+        # LINEAGE: analyze exec events using /proc for parent resolution
         lineage_alerts = lineage_engine.analyze(raw)
 
         for alert in lineage_alerts:
@@ -226,8 +224,7 @@ def run_demo(logger):
                 logger.log_tier_change(lin_change)
 
         # NETWORK: check outbound connections this cycle
-        net_events_raw = collect_network_events()
-        net_alerts     = network_engine.analyze(net_events_raw)
+        net_alerts     = network_engine.analyze()
 
         for alert in net_alerts:
             logger.log_risk({"tier": alert["tier"], "stat_level": "NETWORK",

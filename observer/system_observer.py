@@ -1,9 +1,8 @@
 # observer/system_observer.py
-# Four eBPF hooks:
-#   1. sys_enter_execve   - every process execution
-#   2. sys_enter_openat   - every file open (FIM)
-#   3. sched_process_fork - every fork/clone (lineage)
-#   4. sys_enter_connect  - every outbound connection (network monitor)
+# Two reliable eBPF hooks:
+#   1. sys_enter_execve  - every process execution
+#   2. sys_enter_openat  - every file open (FIM)
+# Lineage + Network use /proc polling (more reliable than eBPF tracepoints)
 
 try:
     from bcc import BPF
@@ -17,9 +16,6 @@ bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
-#include <linux/in.h>
-#include <linux/in6.h>
-#include <uapi/linux/un.h>
 
 #define ARGSIZE  64
 #define PATHSIZE 128
@@ -43,26 +39,8 @@ struct open_data_t {
     char filename[PATHSIZE];
 };
 
-/* ── fork event: parent-child relationship ── */
-struct fork_data_t {
-    u32  parent_pid;
-    u32  child_pid;
-    char parent_comm[16];
-};
-
-/* ── connect event: outbound network connection ── */
-struct net_data_t {
-    u32  pid;
-    char comm[16];
-    u32  daddr;      /* destination IP (IPv4, network byte order) */
-    u16  dport;      /* destination port (network byte order)     */
-    u16  family;     /* AF_INET=2, AF_INET6=10                    */
-};
-
 BPF_PERF_OUTPUT(exec_events);
 BPF_PERF_OUTPUT(open_events);
-BPF_PERF_OUTPUT(fork_events);
-BPF_PERF_OUTPUT(net_events);
 
 /* ── Hook 1: execve ── */
 TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
@@ -105,43 +83,6 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     return 0;
 }
 
-/* ── Hook 3: fork/clone — capture parent-child relationship ── */
-TRACEPOINT_PROBE(sched, sched_process_fork) {
-    struct fork_data_t data = {};
-    data.parent_pid = args->parent_pid;
-    data.child_pid  = args->child_pid;
-    /* Read parent comm from current task — child not yet named at fork time */
-    bpf_get_current_comm(&data.parent_comm, sizeof(data.parent_comm));
-    fork_events.perf_submit(args, &data, sizeof(data));
-    return 0;
-}
-
-/* ── Hook 4: sys_connect — capture every outbound connection attempt ── */
-TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
-    struct net_data_t data = {};
-    data.pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-
-    /* Read sa_family (first 2 bytes of sockaddr) directly */
-    u16 family = 0;
-    bpf_probe_read_user(&family, sizeof(family), (void *)args->uservaddr);
-    data.family = family;
-
-    if (family == 2) {   /* AF_INET = 2 */
-        /* sockaddr_in layout: u16 family, u16 port, u32 addr */
-        u16 port = 0;
-        u32 addr = 0;
-        bpf_probe_read_user(&port, sizeof(port),
-                            (void *)args->uservaddr + 2);
-        bpf_probe_read_user(&addr, sizeof(addr),
-                            (void *)args->uservaddr + 4);
-        data.dport = port;
-        data.daddr = addr;
-    }
-
-    net_events.perf_submit(args, &data, sizeof(data));
-    return 0;
-}
 """
 
 print("[Observer] Compiling eBPF hooks (execve + openat + fork)...")
@@ -150,10 +91,16 @@ b = BPF(text=bpf_text)
 
 exec_buffer = []
 open_buffer = []
-fork_buffer = []
-net_buffer  = []
 
 # ── execve handler ────────────────────────────────────────────────────────────
+def _read_comm(pid):
+    """Read process name from /proc immediately — must be called at event time."""
+    try:
+        with open("/proc/%d/comm" % pid) as f:
+            return f.read().strip()
+    except Exception:
+        return "unknown"
+
 def on_exec_event(cpu, data, size):
     event = b["exec_events"].event(data)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -170,10 +117,17 @@ def on_exec_event(cpu, data, size):
         except Exception:
             continue
     full_cmd = " ".join(parts) or base_cmd
+
+    # Resolve parent name NOW while ppid is still alive in /proc
+    # By the time we process the batch (10s later), short processes are gone
+    ppid        = event.ppid
+    parent_comm = _read_comm(ppid) if ppid else "unknown"
+
     exec_buffer.append({
         "timestamp":     timestamp,
         "pid":           event.pid,
-        "ppid":          event.ppid,
+        "ppid":          ppid,
+        "parent_comm":   parent_comm,   # resolved immediately
         "process_name":  base_cmd,
         "full_cmd":      full_cmd,
         "user":          "root",
@@ -207,64 +161,8 @@ def on_open_event(cpu, data, size):
     })
 
 # ── fork handler ──────────────────────────────────────────────────────────────
-def on_fork_event(cpu, data, size):
-    event = b["fork_events"].event(data)
-    try:
-        parent_comm = event.parent_comm.decode("utf-8", "replace").strip()
-    except Exception:
-        return
-    fork_buffer.append({
-        "parent_pid":  event.parent_pid,
-        "parent_comm": parent_comm,
-        "child_pid":   event.child_pid,
-        "child_comm":  "",   # filled in later via exec event ppid lookup
-        "event_type":  "FORK",
-    })
-
-def on_net_event(cpu, data, size):
-    import socket, struct
-    event = b["net_events"].event(data)
-    try:
-        proc = event.comm.decode("utf-8", "replace").strip()
-    except Exception:
-        proc = "unknown"
-
-    family = event.family
-
-    # Only care about IPv4 (AF_INET=2) for now
-    if family != 2:
-        return
-
-    try:
-        # Convert network-byte-order u32 to dotted IP string
-        daddr = socket.inet_ntoa(struct.pack("I", event.daddr))
-    except Exception:
-        daddr = "unknown"
-
-    try:
-        # Convert network-byte-order u16 to host port
-        dport = socket.ntohs(event.dport)
-    except Exception:
-        dport = 0
-
-    # Skip loopback and unresolved
-    if daddr.startswith("127.") or daddr == "0.0.0.0" or dport == 0:
-        return
-
-    import datetime as _dt
-    net_buffer.append({
-        "timestamp":    _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "pid":          event.pid,
-        "process_name": proc,
-        "dest_ip":      daddr,
-        "dest_port":    dport,
-        "event_type":   "CONNECT",
-    })
-
 b["exec_events"].open_perf_buffer(on_exec_event)
 b["open_events"].open_perf_buffer(on_open_event)
-b["fork_events"].open_perf_buffer(on_fork_event)
-b["net_events"].open_perf_buffer(on_net_event)
 
 def _poll_loop():
     while True:
@@ -292,16 +190,3 @@ def collect_file_events():
     open_buffer.clear()
     return batch
 
-def collect_fork_events():
-    """Fork/spawn events — for lineage_engine pipeline."""
-    global fork_buffer
-    batch = list(fork_buffer)
-    fork_buffer.clear()
-    return batch
-
-def collect_network_events():
-    """Outbound connection events — for network_engine pipeline."""
-    global net_buffer
-    batch = list(net_buffer)
-    net_buffer.clear()
-    return batch

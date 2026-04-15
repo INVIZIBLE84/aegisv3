@@ -2,163 +2,76 @@
 """
 Process Lineage Engine - Aegis-LX
 ===================================
-Tracks parent-child process relationships to detect RCE and
-privilege abuse — regardless of what tool the attacker uses.
+Detects suspicious parent-child process relationships.
 
-THE CORE INSIGHT:
-  A command's danger depends heavily on WHO spawned it.
+Uses /proc/<pid>/status to read PPid — no eBPF needed.
+This works on every Linux kernel without any tracepoint issues.
 
-  SAFE:   bash -> ls          (admin typed ls in terminal)
-  SAFE:   sshd -> bash        (admin logged in via SSH)
-  DANGER: nginx -> bash       (web server spawned a shell = RCE)
-  DANGER: postgres -> whoami  (database spawned recon = RCE)
-  DANGER: python3 -> nc       (script opened reverse shell)
-  DANGER: apache2 -> curl     (web process calling out = likely webshell)
+WHAT IT CATCHES:
+  nginx -> bash       = RCE (web server spawned a shell)
+  postgres -> whoami  = RCE (database spawned recon)
+  python3 -> bash     = suspicious script spawning shell
+  java -> nc          = likely webshell or exploit
 
 HOW IT WORKS:
-  1. Fork hook feeds parent->child PID pairs into a lineage map
-  2. Exec hook provides ppid in each execution event
-  3. Every execution is evaluated: is this parent allowed to spawn this child?
-  4. Suspicious combinations → alert with phase + tier
-
-This catches attacks that bypass both dictionary AND file watchlist:
-  - Custom compiled binaries
-  - Python/Perl one-liners used as shells
-  - Any LOLBin spawned from an unexpected parent
+  Every exec event already has a PID.
+  We read /proc/<pid>/status to get the parent PID (PPid field).
+  We resolve the parent name from /proc/<ppid>/comm.
+  Then we check if this parent-child combination is suspicious.
 """
 
-# ── Processes that should NEVER spawn interactive shells or recon tools ───────
-# These are services. If they spawn a shell, something is very wrong.
-# Aegis's own PID — loaded at runtime so we never flag ourselves
-import os as _os
-AEGIS_PID = _os.getpid()
+import os
+import re as _re
 
+# Aegis own PID — never flag ourselves
+AEGIS_PID = os.getpid()
+
+# ── Processes that should never spawn shells or attack tools ─────────────────
 SUSPICIOUS_PARENTS = {
-    # Web servers
     "nginx", "apache2", "apache", "httpd", "lighttpd", "caddy",
-    # Application servers
-    "tomcat", "java", "node", "ruby", "php", "php-fpm", "php8",
+    "tomcat", "java", "php", "php-fpm", "php8",
     "gunicorn", "uwsgi", "passenger",
-    # Databases
     "postgres", "mysqld", "mongod", "redis-server", "mariadb",
-    # Other services that should never shell out
-    "named", "bind", "vsftpd", "proftpd", "dovecot", "postfix",
-    "sendmail", "exim4", "cups", "cupsd",
-    # Scripting interpreters — spawning a shell from these = suspicious
-    # (Aegis itself is excluded by PID check, not by name)
+    "named", "bind", "vsftpd", "proftpd", "dovecot",
+    "postfix", "sendmail", "exim4",
     "python3", "python", "python2",
-    "perl", "ruby", "lua",
-    "node", "nodejs",
+    "perl", "ruby", "lua", "node", "nodejs",
 }
 
-# ── Shell processes — dangerous when spawned by a service ────────────────────
 SHELL_PROCESSES = {
-    "bash", "sh", "zsh", "dash", "ksh", "fish", "tcsh",
-    "ash", "rbash", "busybox",
+    "bash", "sh", "zsh", "dash", "ksh", "fish",
+    "tcsh", "ash", "rbash", "busybox",
 }
 
-# ── Recon/attack tools — dangerous when spawned by a service ─────────────────
 ATTACK_PROCESSES = {
     "nc", "ncat", "netcat", "nmap", "curl", "wget",
-    "python", "python3", "perl", "ruby", "php",
-    "id", "whoami", "uname", "ifconfig", "ip",
-    "cat", "tac", "less", "more", "head", "tail",
-    "find", "locate", "which", "env", "printenv",
-    "ps", "top", "ss", "netstat", "lsof",
-    "chmod", "chown", "chattr", "passwd",
-    "crontab", "at", "wall",
-    "gcc", "cc", "g++", "make",   # compiling on a prod server = suspicious
+    "id", "whoami", "uname", "ifconfig",
+    "cat", "tac", "find", "env", "printenv",
+    "ps", "ss", "netstat", "lsof",
+    "chmod", "chown", "crontab",
+    "gcc", "cc", "g++", "make",
 }
 
-# ── Trusted parent-child pairs — always safe ─────────────────────────────────
-# Format: (parent, child) — these combinations are explicitly whitelisted
 TRUSTED_PAIRS = {
-    ("sshd",    "bash"),
-    ("sshd",    "sh"),
-    ("sshd",    "zsh"),
-    ("login",   "bash"),
-    ("login",   "sh"),
-    ("login",   "zsh"),
-    ("sudo",    "bash"),
-    ("su",      "bash"),
-    ("cron",    "bash"),
-    ("cron",    "sh"),
-    ("systemd", "bash"),
-    ("systemd", "sh"),
-    ("bash",    "bash"),    # shell spawning subshell
-    ("bash",    "sh"),
-    ("sh",      "sh"),
-    ("sh",      "bash"),
-    ("zsh",     "bash"),
-    ("tmux",    "bash"),
-    ("screen",  "bash"),
-    ("xterm",   "bash"),
-    ("gnome-terminal", "bash"),
+    ("sshd","bash"),("sshd","sh"),("sshd","zsh"),
+    ("login","bash"),("login","sh"),("login","zsh"),
+    ("sudo","bash"),("su","bash"),
+    ("cron","bash"),("cron","sh"),
+    ("systemd","bash"),("systemd","sh"),
+    ("bash","bash"),("bash","sh"),
+    ("sh","sh"),("sh","bash"),
+    ("zsh","bash"),("tmux","bash"),("screen","bash"),
+    ("gnome-terminal","bash"),("xterm","bash"),
 }
 
-# Severity of the finding based on what combination was detected
-def _classify(parent, child, parent_pid=None):
-    """
-    Returns (phase, tier, description) or None if not suspicious.
-    parent_pid: if provided, skip if this is Aegis's own PID.
-    """
-    # Never flag Aegis's own python3 process
-    if parent_pid is not None and parent_pid == AEGIS_PID:
-        return None
-
-    # Scripting interpreter or service spawning a shell = RCE
-    if parent in SUSPICIOUS_PARENTS and child in SHELL_PROCESSES:
-        return (
-            "EXECUTION",
-            4,
-            parent + " spawned shell " + child + " -- likely RCE"
-        )
-
-    # Scripting interpreter or service spawning an attack tool
-    if parent in SUSPICIOUS_PARENTS and child in ATTACK_PROCESSES:
-        return (
-            "EXECUTION",
-            3,
-            parent + " spawned " + child + " -- suspicious behaviour"
-        )
-
-    return None
 
 
 class LineageEngine:
-    """
-    Tracks process parent-child relationships and flags suspicious spawn chains.
-
-    Handles multi-hop chains:
-      python3 -> sh -> bash -> whoami
-    Once a suspicious parent spawns anything, its children are "tainted" —
-    tracked in a tainted_pids set so the chain is followed.
-    """
-
     def __init__(self):
-        self.pid_map     = {}   # pid -> process_name
-        self.tainted     = {}   # pid -> reason (why this pid is tainted)
-        self.MAX_PIDS    = 2000
+        self.tainted = {}     # pid -> reason
         self.MAX_TAINTED = 500
 
-    def ingest_fork(self, fork_events):
-        """Feed fork events — propagate taint to children."""
-        for ev in fork_events:
-            ppid  = ev.get("parent_pid")
-            cpid  = ev.get("child_pid")
-            pname = ev.get("parent_comm", "")
-            self._register(ppid, pname)
-            # If parent is tainted, child inherits taint
-            if ppid in self.tainted:
-                self._taint(cpid, "child of tainted PID " + str(ppid) +
-                            " (" + self.tainted[ppid] + ")")
-
     def analyze(self, exec_events):
-        """
-        Check each execution for suspicious parent-child combinations.
-        Also flags any exec by a tainted process.
-        Returns list of lineage alert dicts.
-        """
         alerts = []
 
         for ev in exec_events:
@@ -166,36 +79,48 @@ class LineageEngine:
             ppid  = ev.get("ppid")
             child = ev.get("process_name", "unknown")
 
-            self._register(pid, child)
-
-            if not ppid:
+            if not pid:
                 continue
 
-            parent = self.pid_map.get(ppid, "unknown")
+            # Skip Aegis itself
+            if pid == AEGIS_PID or ppid == AEGIS_PID:
+                continue
 
-            # ── Check 1: direct suspicious parent-child ───────────────────
-            if parent != "unknown" and (parent, child) not in TRUSTED_PAIRS:
-                result = _classify(parent, child, parent_pid=ppid)
-                if result:
-                    phase, tier, description = result
-                    # Taint this pid so its children are also tracked
-                    self._taint(pid, description)
-                    alerts.append(self._make_alert(
-                        ppid, parent, pid, child, ev, phase, tier, description))
-                    continue
+            # Use parent_comm resolved at event time (not /proc which may be stale)
+            parent = ev.get("parent_comm", "unknown")
+            if not parent or parent == "unknown":
+                continue
 
-            # ── Check 2: tainted parent executing anything notable ─────────
+            # Skip trusted pairs
+            if (parent, child) in TRUSTED_PAIRS:
+                continue
+
+            # Check 1: suspicious parent spawning shell = RCE
+            if parent in SUSPICIOUS_PARENTS and child in SHELL_PROCESSES:
+                reason = parent + " spawned shell " + child + " -- likely RCE"
+                self._taint(pid, reason)
+                alerts.append(self._alert(ppid, parent, pid, child, ev,
+                                          "EXECUTION", 4, reason))
+                continue
+
+            # Check 2: suspicious parent spawning attack tool
+            if parent in SUSPICIOUS_PARENTS and child in ATTACK_PROCESSES:
+                reason = parent + " spawned " + child + " -- suspicious"
+                self._taint(pid, reason)
+                alerts.append(self._alert(ppid, parent, pid, child, ev,
+                                          "EXECUTION", 3, reason))
+                continue
+
+            # Check 3: tainted parent chain
             if ppid in self.tainted and child in (SHELL_PROCESSES | ATTACK_PROCESSES):
-                reason = self.tainted[ppid]
-                description = "tainted chain: " + child + " spawned from " + parent + " (" + reason + ")"
-                self._taint(pid, description)
-                alerts.append(self._make_alert(
-                    ppid, parent, pid, child, ev,
-                    "EXECUTION", 3, description))
+                reason = "tainted chain: " + parent + " -> " + child
+                self._taint(pid, reason)
+                alerts.append(self._alert(ppid, parent, pid, child, ev,
+                                          "EXECUTION", 3, reason))
 
         return alerts
 
-    def _make_alert(self, ppid, parent, pid, child, ev, phase, tier, description):
+    def _alert(self, ppid, parent, pid, child, ev, phase, tier, detail):
         return {
             "source":      "LINEAGE",
             "parent_pid":  ppid,
@@ -206,7 +131,7 @@ class LineageEngine:
             "phase":       phase,
             "tier":        tier,
             "mitre":       "T1059 (Command Execution via " + parent + ")",
-            "detail":      description,
+            "detail":      detail,
             "timestamp":   ev.get("timestamp", ""),
         }
 
@@ -218,12 +143,3 @@ class LineageEngine:
             for k in keys:
                 del self.tainted[k]
         self.tainted[pid] = reason
-
-    def _register(self, pid, name):
-        if pid is None or not name:
-            return
-        if len(self.pid_map) >= self.MAX_PIDS:
-            keys = list(self.pid_map.keys())[:200]
-            for k in keys:
-                del self.pid_map[k]
-        self.pid_map[pid] = name
