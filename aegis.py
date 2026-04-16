@@ -5,6 +5,7 @@ import time, argparse, signal, sys, os
 from datetime import datetime
 from observer.system_observer import collect_process_info, collect_file_events
 from detection.network_engine import NetworkEngine
+from detection.ransomware_engine import RansomwareEngine
 from detection.fim_engine import FIMEngine
 from detection.lineage_engine import LineageEngine
 from translator.signal_translator import translate_process_to_signals
@@ -114,6 +115,25 @@ def print_network_panel(net_alerts):
     print("  " + W + "+" + "-"*50 + R)
 
 
+def print_ransomware_panel(ransom_alerts):
+    print("\n  " + RE + "+-- RANSOMWARE DETECTOR (entropy + access pattern)" + R)
+    if not ransom_alerts:
+        print("  " + RE + "|" + R + "  " + G + "No ransomware patterns detected" + R)
+    for a in ransom_alerts:
+        tc = RE if a["tier"] >= 4 else Y
+        print("  " + RE + "|" + R + "  " + tc + "! [T1486] " + a["process"] +
+              " accessed " + str(a["files_accessed"]) + " files" + R)
+        if a["high_entropy_files"] > 0:
+            print("  " + RE + "|" + R + "  " + RE + B +
+                  "  ENCRYPTION DETECTED: " + str(a["high_entropy_files"]) +
+                  " files at " + str(a["sample_entropy"]) + " bits entropy" + R)
+            print("  " + RE + "|" + R + "    " + DIM + "sample: " +
+                  a["sample_file"][-50:] + R)
+        else:
+            print("  " + RE + "|" + R + "    " + DIM + a["detail"][:65] + R)
+    print("  " + RE + "+" + "-"*50 + R)
+
+
 PHASE_ORDER = ["RECON","DISCOVERY","CREDENTIAL","EXECUTION","PERSISTENCE","EXFILTRATION","LATERAL"]
 
 def print_killchain_panel(sig_result, tier_manager):
@@ -205,6 +225,24 @@ def run_demo(logger):
         logger.log_demo_event(phase_label, description)
         stat_report = stat_engine.observe(fake_signals)
         sig_result  = sig_engine.analyze(fake_signals)
+        # RANSOMWARE: analyze file events for rapid access + entropy spike
+        ransom_alerts = ransomware_engine.analyze(file_events)
+
+        for alert in ransom_alerts:
+            logger.log_risk({"tier": alert["tier"], "stat_level": "RANSOMWARE",
+                             "sig_score": 0, "phases": [alert["phase"]],
+                             "ransom_detail": alert["detail"]})
+            if alert["tier"] > tier_manager.current:
+                rc = tier_manager._escalate_to(
+                    alert["tier"],
+                    "[RANSOM] " + alert["detail"],
+                    __import__('time').time()
+                )
+                apply_tier(rc["new_tier"], rc["old_tier"], [])
+                alert_tier_change(rc["old_tier"], rc["new_tier"],
+                                  rc["reason"], [])
+                logger.log_tier_change(rc)
+
         # LINEAGE: analyze exec events using /proc for parent resolution
         lineage_alerts = lineage_engine.analyze(raw)
 
@@ -250,6 +288,7 @@ def run_demo(logger):
         print_stat_panel(stat_report)
         print_sig_panel(sig_result)
         print_fim_panel(fim_alerts)
+        print_ransomware_panel(ransom_alerts)
         print_lineage_panel(lineage_alerts)
         print_network_panel(net_alerts)
         print_killchain_panel(sig_result, tier_manager)
@@ -267,8 +306,9 @@ def run_monitor(logger):
     sig_engine   = SignatureEngine()
     fim_engine     = FIMEngine()
     lineage_engine  = LineageEngine()
-    network_engine  = NetworkEngine()
-    tier_manager    = TierManager()
+    network_engine     = NetworkEngine()
+    ransomware_engine  = RansomwareEngine()
+    tier_manager       = TierManager()
     cycle        = 0
 
     def on_exit(sig, frame):
